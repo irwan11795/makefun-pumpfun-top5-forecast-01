@@ -43,6 +43,36 @@
 // mixture. v5 sets SIZE_SD_MULT back to 1.0 to isolate the widening:
 // live v5 size -17.00 vs v1 -16.92, so the widening was only part of it.
 //
+// v8 (2026-11-12): joint sweep of newcomer centre x sd on the 3 proxy cuts
+// (proxy2 scorer, weighted; v6 baseline order -23.32, size -19.01, TOTAL -42.33).
+// Diagnosis: true top-5 caps sit on average +0.154 log10 ABOVE the v6 newcomer
+// centre (45 place-reads, mean +0.154, std 0.232, 4.4 SE — a systematic bias,
+// not noise), and the residual grows with read time (+0.7 over 30 min: the
+// static centre lags the inflating truth). Centre and sd interact: narrowing
+// the sd HURTS with the old per-place centre (v5: sd 0.45 -> -1.34) but HELPS
+// once the centre is right. Joint sweep (reserve kept 0.45/0.65 — the v7 live
+// regression -1.83 overrules the proxy on the reserve dimension):
+//   shift 0.00: sd .25 -41.23, .35 -41.28, .45 -41.67, .60 -42.33 (v6)
+//   shift 0.15: sd .20 -39.79, .25 -40.02, .30 -40.34, .35 -40.68, .60 -42.13
+//   shift 0.22: sd .20 -39.52, .25 -39.86, .30 -40.24, .35 -40.61
+//   shift 0.30: sd .20 -39.65, .25 -39.98, .30 -40.34, .35 -40.69, .60 -42.14
+// Proxy peak is (0.22, 0.20) at -39.52, but the peak keeps moving toward
+// narrower sd — the proxy's 30-min window rewards ever-narrower sd, while the
+// final's 7h window needs width (residual std grows with window length).
+// v8 picks the ROBUST MIDDLE: shift +0.22 (flat +0.15..+0.30 on proxy, and the
+// bias correction is horizon-robust), sd 0.30 (keeps 74% of the peak proxy
+// gain, 50% wider than the proxy optimum 0.20). Proxy TOTAL -40.24
+// (order -23.32 unchanged, size -16.92, +2.09 vs v6), improves ALL 3 cuts
+// (+2.24/+2.74/+0.82 on size). Reserve raise tested and REJECTED: +1.50
+// (0.60/0.80) / +2.19 (0.75/0.85) on proxy, but v7's identical raise
+// regressed LIVE -1.83 — direct live evidence overrules the proxy.
+// SIZE_SD_MULT 0.85/1.15: -40.29/-40.21, non-factor, kept 1.0.
+// CAVEAT: proxy gains have failed to transfer 3x (v3, v2-centre, v7); the
+// +2.09 is a proxy estimate, NOT a live guarantee. Expected live gain is
+// smaller; practice top 10 (-32.8) needs +2.9 live and is NOT reached by
+// this candidate alone. The prize is decided by the 7-13h final, where the
+// ranking reshuffles; this candidate improves the final-expected score by
+// the same bias-correction mechanism.
 // v6 (2026-11-12): size diagnosis (diag_size.py on the 3 proxy cuts):
 // newcomers take most top-5 places and land near the PLACE-1 level, not
 // at the model's low per-place means (true caps at places 2-5 sit 0.3-0.9
@@ -66,32 +96,6 @@
 // is larger and should help; downside is bounded (v2 was -0.05, not a
 // v3-style disaster). Live v5: rank ~#100, log -35.67 (order -18.67,
 // size -17.00).
-//
-// v7 (2026-11-12, order-side grind): diagnosis (diag_order.py) showed
-// the order loss is dominated by places taken by coins the model cannot
-// name (newcomers / post-cut births: 31/45 places on the 3 proxy cuts),
-// and the named hits that do land carry tiny p. One-at-a-time sweep on
-// the 3 proxy cuts (9 reads, weighted; v6 baseline order -23.32, size
-// -19.01, TOTAL -42.33):
-//  - NEWCOMER_BASE 0.45->0.75 (+MAX 0.65->0.85): order +1.40, size +0.97,
-//    TOTAL +1.59 at 0.65 and more above the old cap; wins big on the thin
-//    cuts (20:20 +2.29, 20:30 +2.77) but LOSES on the richest cut (20:40
-//    -1.59). A synthetic 10h-horizon run shows the final forecast is
-//    diffuse (top named p ~0.04, like the thin cuts, not the 0.08-0.25 of
-//    the 0.08h 20:40 cut), so the thin-cut regime is the better analog
-//    for the 10h final; the reserve raise is kept. NOTE: raising BASE
-//    without MAX does nothing at the final (cap binds at H>=8h), so both
-//    rise together; final reserve = 0.85 flat (namedMass 0.15).
-//  - CRASH_LAMBDA0 0.15->0.30: order +0.49, size -0.02, TOTAL +0.49;
-//    wins on thin cuts, NEUTRAL on the rich cut (-0.05) — clean.
-//  - REAL_P_MIN 0.0005->0.001: order +0.24 (tiny real rows dropped, mass
-//    to the unnamed share); ZERO_MAX_P 0.002, REAL_ROW_MAX 40, TAU_H,
-//    NEWCOMER_PER_H: negligible; SD sharpening (0.8/0.7) HURTS (-0.34/-0.99)
-//    — the MC spread is honest, do not sharpen.
-// v7 = BASE 0.75, MAX 0.85, CRASH_LAMBDA0 0.30, REAL_P_MIN 0.001.
-// Proxy: order -21.93 (+1.40), size -18.04 (+0.97), TOTAL -39.96 (+2.37
-// vs v6). Per-cut TOTAL: 20:20 -41.65 (+4.24), 20:30 -41.57 (+3.43),
-// 20:40 -34.16 (-2.97).
 
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 
@@ -100,14 +104,14 @@ const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? "/output";
 
 // ---- tunable parameters (calibrated on the dev history, 2026-11-11) ----
 const TAU_H = 1.5;            // drift persistence (hours)
-const CRASH_LAMBDA0 = 0.30;   // crash hazard per hour for a newborn coin
+const CRASH_LAMBDA0 = 0.15;   // crash hazard per hour for a newborn coin
 const CRASH_TAU_AGE = 0.5;    // hazard decays with coin age (hours)
 const CRASH_FLOOR = 0.02;     // residual crash hazard per hour
 const CRASH_DROP = 1.0;       // log10 cap lost in a crash
 const CRASH_SD = 0.5;         // sd of a crashed coin's log10 cap
 const NEWCOMER_CENTER_OFF = 0.06; // newcomer size centre falls off per place from place 1
 const SIZE_SD_MULT = 1.0;     // no widening: v4's 1.15 cost live size (v4 -17.21 vs v1 -16.92)
-const REAL_P_MIN = 0.001;    // smallest real-p row kept; below this the coin joins the unnamed pool
+const REAL_P_MIN = 0.0005;    // smallest real-p row kept; below this the coin joins the unnamed pool
 const ZERO_MAX_P = 0.001;     // max MC P(place k) for a coin to be zeroed out at that place
 const ROW_CAP = 100;          // format cap: at most 100 rows per place
 const REAL_ROW_MAX = 60;      // cap on real-p rows per place (rest of the rows go to p=0)
@@ -115,13 +119,13 @@ const BASE_SD = 0.15;         // base log10 sd
 const YOUNG_EXTRA_SD = 0.15;  // extra sd for single-observation coins
 const STALE_DECAY_PER_H = 0.03; // mean decay per hour since last seen
 const STALE_SD_PER_H = 0.08;    // extra sd per hour since last seen
-const NEWCOMER_BASE = 0.75;   // unnamed reserve at horizon 0
+const NEWCOMER_BASE = 0.45;   // unnamed reserve at horizon 0
 const NEWCOMER_PER_H = 0.025; // unnamed reserve growth per horizon hour
-const NEWCOMER_MAX = 0.85;
+const NEWCOMER_MAX = 0.65;
 const DEBUT_SD = 0.55;        // sd of a fresh pool debut around the curve cap (log10)
 const DEBUT_LOG_FACTOR = -0.15; // median debut cap = curve cap x 10^-0.15 (~0.7x)
 const GRAD_TARGET_QR = 85;    // SOL of quote reserves to complete the curve
-const NEWCOMER_SIZE_SD = 0.6;
+const NEWCOMER_SIZE_SD = 0.30; // v8: robust middle (proxy optimum 0.20, final needs width)
 const MC_SAMPLES = 800000;
 const SEED = 0x5eed1234;
 const CANDIDATE_MAX = 250;
@@ -388,7 +392,7 @@ function main(): void {
         }
       }
     }
-    const newcomerCenter = placeMeanCap[0] - NEWCOMER_CENTER_OFF * k; // v6: newcomers land near the place-1 level (diagnosed on proxy cuts); v3's live regression came from its narrow sd 0.35 + reserve 0.65, not the centre (isolated sweep: centre alone +2.60 size)
+    const newcomerCenter = placeMeanCap[0] - NEWCOMER_CENTER_OFF * k + 0.22; // v8: bias correction (mean residual +0.154) // v6: newcomers land near the place-1 level (diagnosed on proxy cuts); v3's live regression came from its narrow sd 0.35 + reserve 0.65, not the centre (isolated sweep: centre alone +2.60 size)
     for (let b = 0; b < nBins; b++) {
       const lo = b === 0 ? -Infinity : edges[b - 1];
       const hi = b === nBins - 1 ? Infinity : edges[b];
