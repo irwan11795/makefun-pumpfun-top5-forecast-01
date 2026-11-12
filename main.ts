@@ -12,9 +12,8 @@
 //    a debuting coin's cap centres on its curve cap (~0.7x, wide sd) because
 //    observed curve->pool transitions mostly land at or below the curve cap.
 //  - age-dependent crash hazard: a newborn curve coin can rug (hazard
-//    lambda0=0.30/h at birth, decaying with age tau=0.5h, floor 0.02/h);
-//    a crash costs ~1.0 log10 of cap. Calibrated: curve coins aged 0-10m
-//    halved ~4.8% per 10 min in the dev history; pool coins run up instead.
+//    lambda0=0.15/h at birth, decaying with age tau=0.5h, floor 0.02/h);
+//    a crash costs ~1.0 log10 of cap.
 //  - rank probabilities: seeded Monte Carlo (mulberry32, 800k samples) over
 //    candidates; sample count chosen so the tail probabilities are stable.
 //  - unnamed reserve per place grows with horizon (newcomers are born after
@@ -22,19 +21,21 @@
 //    up to a 0.65 cap; the reserve also carries coins the model cannot name.
 //  - size bins: per-place mixture of the named coins' predicted cap
 //    distributions plus a newcomer component centred on the Monte Carlo
-//    place-1 mean (the top-5 caps bunch near the leader; newcomers enter
-//    within ~0.25 log10 of place 1), sd 0.35.
+//    mean cap at that place (placeMeanCap[k]), sd 0.6.
 //  - p=0 rows: likely-chart coins with negligible MC P(place) are named at
 //    p=0 (max 100 rows/place, format-compliant) so the unnamed share
 //    concentrates on the coins that could actually place.
 //
-// v3 tuning (2026-11-12, three hold-out cuts of the dev history, corrected
-// proxy scorer with the true unnamed-denominator rule; weighted mean over
-// 9 reads): v1 -46.00, v2 -42.28, v3 -38.91. Wins vs v1 on every cut
-// (+10.6 / +6.4 / +0.5). Ablations: no-crash -43.33 (crash helps), crash
-// lambda 0.45 -39.30 (0.30 is the sweet spot), newcomer size sd 0.6 -42.28
-// vs 0.35 -41.23, centre offset 0.12 -42.31 vs 0.0 -40.78, reserve base
-// 0.40 -41.30 vs 0.65 -39.08 (capped at 0.65).
+// v4 (2026-11-12): v3 REGRESSED live (rank 213/343, log -38.3, size -19.19
+// vs v1 rank 67, log -35.92, size -16.92) even though the 3-cut proxy said
+// v3 beats v1 by +7.09. Lesson: the proxy cuts (truth 10-30 min after the
+// cut) do not represent the live reads (0-60 min after history_until);
+// the short-horizon tuning — narrow newcomer sd 0.35, centre at the
+// place-1 level, reserve 0.65 — overshot the live size distribution.
+// v4 reverts ONLY the size parameters to v1's (centre placeMeanCap[k],
+// sd 0.6, reserve base 0.45) and keeps the order-side improvements
+// (crash hazard, p=0 zero rows, 800k samples), so its live size should
+// match v1's while its order keeps the crash/zeroing gains.
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 
 const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? "/input";
@@ -42,12 +43,12 @@ const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? "/output";
 
 // ---- tunable parameters (calibrated on the dev history, 2026-11-11) ----
 const TAU_H = 1.5;            // drift persistence (hours)
-const CRASH_LAMBDA0 = 0.30;   // crash hazard per hour for a newborn coin
+const CRASH_LAMBDA0 = 0.15;   // crash hazard per hour for a newborn coin
 const CRASH_TAU_AGE = 0.5;    // hazard decays with coin age (hours)
 const CRASH_FLOOR = 0.02;     // residual crash hazard per hour
 const CRASH_DROP = 1.0;       // log10 cap lost in a crash
 const CRASH_SD = 0.5;         // sd of a crashed coin's log10 cap
-const NEWCOMER_CENTER_OFF = 0.0; // newcomer size centre falls off per place from place 1
+const NEWCOMER_CENTER_OFF = 0.06; // newcomer size centre falls off per place from place 1
 const SIZE_SD_MULT = 1.15;    // widen all size sds (calibration)
 const REAL_P_MIN = 0.0005;    // smallest real-p row kept; below this the coin joins the unnamed pool
 const ZERO_MAX_P = 0.001;     // max MC P(place k) for a coin to be zeroed out at that place
@@ -57,13 +58,13 @@ const BASE_SD = 0.15;         // base log10 sd
 const YOUNG_EXTRA_SD = 0.15;  // extra sd for single-observation coins
 const STALE_DECAY_PER_H = 0.03; // mean decay per hour since last seen
 const STALE_SD_PER_H = 0.08;    // extra sd per hour since last seen
-const NEWCOMER_BASE = 0.65;   // unnamed reserve at horizon 0
+const NEWCOMER_BASE = 0.45;   // unnamed reserve at horizon 0
 const NEWCOMER_PER_H = 0.025; // unnamed reserve growth per horizon hour
 const NEWCOMER_MAX = 0.65;
 const DEBUT_SD = 0.55;        // sd of a fresh pool debut around the curve cap (log10)
 const DEBUT_LOG_FACTOR = -0.15; // median debut cap = curve cap x 10^-0.15 (~0.7x)
 const GRAD_TARGET_QR = 85;    // SOL of quote reserves to complete the curve
-const NEWCOMER_SIZE_SD = 0.35;
+const NEWCOMER_SIZE_SD = 0.6;
 const MC_SAMPLES = 800000;
 const SEED = 0x5eed1234;
 const CANDIDATE_MAX = 250;
@@ -330,7 +331,7 @@ function main(): void {
         }
       }
     }
-    const newcomerCenter = placeMeanCap[0] - NEWCOMER_CENTER_OFF * k;
+    const newcomerCenter = placeMeanCap[k]; // v1 centre: MC mean cap at this place (v2/v3 recenter to place-1 level overshot live: v3 size -19.19 vs v1 -16.92)
     for (let b = 0; b < nBins; b++) {
       const lo = b === 0 ? -Infinity : edges[b - 1];
       const hi = b === nBins - 1 ? Infinity : edges[b];
