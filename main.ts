@@ -11,14 +11,30 @@
 //    from quote reserves vs the ~85 SOL completion level and the inflow rate;
 //    a debuting coin's cap centres on its curve cap (~0.7x, wide sd) because
 //    observed curve->pool transitions mostly land at or below the curve cap.
-//  - rank probabilities: seeded Monte Carlo (mulberry32, 400k samples) over
+//  - age-dependent crash hazard: a newborn curve coin can rug (hazard
+//    lambda0=0.30/h at birth, decaying with age tau=0.5h, floor 0.02/h);
+//    a crash costs ~1.0 log10 of cap. Calibrated: curve coins aged 0-10m
+//    halved ~4.8% per 10 min in the dev history; pool coins run up instead.
+//  - rank probabilities: seeded Monte Carlo (mulberry32, 800k samples) over
 //    candidates; sample count chosen so the tail probabilities are stable.
 //  - unnamed reserve per place grows with horizon (newcomers are born after
-//    the cut; in practice ~3 of 9 coins that ever held top-5 were newcomers;
-//    tuned on two hold-outs against the house baseline, which this beats by
-//    ~+2.7 and ~+9.1 per read on the two cuts).
+//    the cut; in practice ~3 of 9 coins that ever held top-5 were newcomers)
+//    up to a 0.65 cap; the reserve also carries coins the model cannot name.
 //  - size bins: per-place mixture of the named coins' predicted cap
-//    distributions plus a newcomer component.
+//    distributions plus a newcomer component centred on the Monte Carlo
+//    place-1 mean (the top-5 caps bunch near the leader; newcomers enter
+//    within ~0.25 log10 of place 1), sd 0.35.
+//  - p=0 rows: likely-chart coins with negligible MC P(place) are named at
+//    p=0 (max 100 rows/place, format-compliant) so the unnamed share
+//    concentrates on the coins that could actually place.
+//
+// v3 tuning (2026-11-12, three hold-out cuts of the dev history, corrected
+// proxy scorer with the true unnamed-denominator rule; weighted mean over
+// 9 reads): v1 -46.00, v2 -42.28, v3 -38.91. Wins vs v1 on every cut
+// (+10.6 / +6.4 / +0.5). Ablations: no-crash -43.33 (crash helps), crash
+// lambda 0.45 -39.30 (0.30 is the sweet spot), newcomer size sd 0.6 -42.28
+// vs 0.35 -41.23, centre offset 0.12 -42.31 vs 0.0 -40.78, reserve base
+// 0.40 -41.30 vs 0.65 -39.08 (capped at 0.65).
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 
 const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? "/input";
@@ -26,18 +42,29 @@ const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? "/output";
 
 // ---- tunable parameters (calibrated on the dev history, 2026-11-11) ----
 const TAU_H = 1.5;            // drift persistence (hours)
+const CRASH_LAMBDA0 = 0.30;   // crash hazard per hour for a newborn coin
+const CRASH_TAU_AGE = 0.5;    // hazard decays with coin age (hours)
+const CRASH_FLOOR = 0.02;     // residual crash hazard per hour
+const CRASH_DROP = 1.0;       // log10 cap lost in a crash
+const CRASH_SD = 0.5;         // sd of a crashed coin's log10 cap
+const NEWCOMER_CENTER_OFF = 0.0; // newcomer size centre falls off per place from place 1
+const SIZE_SD_MULT = 1.15;    // widen all size sds (calibration)
+const REAL_P_MIN = 0.0005;    // smallest real-p row kept; below this the coin joins the unnamed pool
+const ZERO_MAX_P = 0.001;     // max MC P(place k) for a coin to be zeroed out at that place
+const ROW_CAP = 100;          // format cap: at most 100 rows per place
+const REAL_ROW_MAX = 60;      // cap on real-p rows per place (rest of the rows go to p=0)
 const BASE_SD = 0.15;         // base log10 sd
 const YOUNG_EXTRA_SD = 0.15;  // extra sd for single-observation coins
 const STALE_DECAY_PER_H = 0.03; // mean decay per hour since last seen
 const STALE_SD_PER_H = 0.08;    // extra sd per hour since last seen
-const NEWCOMER_BASE = 0.45;   // unnamed reserve at horizon 0
+const NEWCOMER_BASE = 0.65;   // unnamed reserve at horizon 0
 const NEWCOMER_PER_H = 0.025; // unnamed reserve growth per horizon hour
 const NEWCOMER_MAX = 0.65;
 const DEBUT_SD = 0.55;        // sd of a fresh pool debut around the curve cap (log10)
 const DEBUT_LOG_FACTOR = -0.15; // median debut cap = curve cap x 10^-0.15 (~0.7x)
 const GRAD_TARGET_QR = 85;    // SOL of quote reserves to complete the curve
-const NEWCOMER_SIZE_SD = 0.6;
-const MC_SAMPLES = 400000;
+const NEWCOMER_SIZE_SD = 0.35;
+const MC_SAMPLES = 800000;
 const SEED = 0x5eed1234;
 const CANDIDATE_MAX = 250;
 const LAMPORTS_PER_SOL = 1e9;
@@ -52,7 +79,7 @@ type Coin = {
   mint: string;
   pts: { t: number; y: number; venue: string; qr: number }[];
   createdAt: number; // hours since t0
-  mean: number; sd: number; gradProb: number;
+  mean: number; sd: number; gradProb: number; survival: number; mayhem: boolean;
   lastVenue: string; lastT: number; lastY: number;
 };
 
@@ -113,11 +140,12 @@ function main(): void {
       if (!(capSol > 0)) continue;
       let c = coins.get(r.mint);
       if (!c) {
-        c = { mint: r.mint, pts: [], createdAt: Date.parse(r.created_at) / 3600000 - t0, mean: 0, sd: 0, gradProb: 0, lastVenue: r.venue, lastT: mt, lastY: 0 };
+        c = { mint: r.mint, pts: [], createdAt: Date.parse(r.created_at) / 3600000 - t0, mean: 0, sd: 0, gradProb: 0, survival: 1, mayhem: false, lastVenue: r.venue, lastT: mt, lastY: 0 };
         coins.set(r.mint, c);
       }
       c.pts.push({ t: mt, y: Math.log10(capSol), venue: r.venue, qr: Number(r.quote_reserves_lamports ?? 0) / LAMPORTS_PER_SOL });
       c.lastVenue = r.venue; c.lastT = mt; c.lastY = Math.log10(capSol);
+      if (r.mayhem) c.mayhem = true;
     }
   }
 
@@ -169,6 +197,11 @@ function main(): void {
         c.gradProb = Math.min(0.2, 0.03 * horizon);
       }
     }
+    // Age-dependent crash hazard: a newborn coin can rug; survivors get safer.
+    // Hazard integrated over the horizon: floor*H + lambda0*tau*(e^{-age/tau} - e^{-(age+H)/tau}).
+    const ageH = Math.max(0, historyUntilRel - c.createdAt);
+    const haz = CRASH_FLOOR * horizon + CRASH_LAMBDA0 * CRASH_TAU_AGE * (Math.exp(-ageH / CRASH_TAU_AGE) - Math.exp(-(ageH + horizon) / CRASH_TAU_AGE));
+    c.survival = Math.exp(-haz);
     all.push(c);
   }
 
@@ -188,7 +221,10 @@ function main(): void {
     const top: { mint: string; v: number }[] = [];
     for (const c of cand) {
       let v: number;
-      if (c.lastVenue === "curve" && c.gradProb > 0) {
+      if (rand() > c.survival) {
+        // Crashed (rug): cap collapses far below the top-5 level.
+        v = c.lastY - CRASH_DROP + CRASH_SD * randn();
+      } else if (c.lastVenue === "curve" && c.gradProb > 0) {
         // Graduating: the debut pool cap centres on the curve cap (~0.7x),
         // wide because a hot debut can run up fast after migration.
         if (rand() < c.gradProb) v = c.lastY + DEBUT_LOG_FACTOR + DEBUT_SD * randn();
@@ -211,10 +247,23 @@ function main(): void {
   for (let k = 0; k < places; k++) placeMeanCap[k] /= MC_SAMPLES;
 
   // ---- probabilities with newcomer reserve ----
+  // Row budget per place is 100 (format cap). Real-p rows go to the coins the
+  // Monte Carlo puts at that place; the remaining slots go to p=0 rows on the
+  // coins most likely to be on the chart but almost certain not to take this
+  // place: the rules score a p=0 row as 0 for its coin and take it out of the
+  // place's unnamed share, so the share concentrates on the coins left
+  // unnamed (newcomers and movers). A p=0 row on a coin that does take the
+  // place scores the floor, so only coins with negligible MC P(place) qualify.
   const newcomerReserve = Math.min(NEWCOMER_MAX, NEWCOMER_BASE + NEWCOMER_PER_H * horizon);
   const namedMass = 1 - newcomerReserve;
   const probabilities: { mint: string; place: number; p: number }[] = [];
   const placeNamed = new Map<number, { mint: string; p: number }[]>(); // normalized to sum 1
+  // Likely-chart coins: top by predicted mean (pool coins first — a mayhem
+  // coin still on its curve has its rows dropped by the scorer, so it cannot
+  // shrink the unnamed share).
+  const chartLikely = [...all]
+    .sort((a, b) => (a.lastVenue === "pool" ? 0 : 1) - (b.lastVenue === "pool" ? 0 : 1) || b.mean - a.mean || (a.mint < b.mint ? -1 : 1))
+    .slice(0, 150);
   for (let k = 0; k < places; k++) {
     const rows: { mint: string; p: number }[] = [];
     let total = 0;
@@ -224,10 +273,29 @@ function main(): void {
     }
     rows.sort((a, b) => b.p - a.p || (a.mint < b.mint ? -1 : 1));
     const named: { mint: string; p: number }[] = [];
+    const realRows: { mint: string; p: number }[] = [];
+    let keptFrac = 0;
     for (const r of rows) {
       const p = floor6((r.p / total) * namedMass);
-      if (p > 0) { probabilities.push({ mint: r.mint, place: k + 1, p }); named.push({ mint: r.mint, p: r.p / total }); }
+      if (p >= REAL_P_MIN && realRows.length < REAL_ROW_MAX) {
+        realRows.push({ mint: r.mint, p });
+        named.push({ mint: r.mint, p: r.p / total });
+        keptFrac += r.p / total;
+      }
     }
+    // Renormalize the size fractions over the kept rows.
+    if (keptFrac > 0) for (const n of named) n.p /= keptFrac;
+    const used = new Set(realRows.map((r) => r.mint));
+    const zeroRows: { mint: string; p: number }[] = [];
+    for (const c of chartLikely) {
+      if (realRows.length + zeroRows.length >= ROW_CAP) break;
+      if (used.has(c.mint)) continue;
+      if (c.mayhem && c.lastVenue === "curve") continue;
+      const pk = (counts.get(c.mint)?.[k] ?? 0) / MC_SAMPLES;
+      if (pk < ZERO_MAX_P) zeroRows.push({ mint: c.mint, p: 0 });
+    }
+    for (const r of realRows) probabilities.push({ mint: r.mint, place: k + 1, p: r.p });
+    for (const r of zeroRows) probabilities.push({ mint: r.mint, place: k + 1, p: 0 });
     placeNamed.set(k, named);
   }
   probabilities.sort((a, b) => a.place - b.place || b.p - a.p || (a.mint < b.mint ? -1 : 1));
@@ -236,6 +304,10 @@ function main(): void {
   const top5 = all.slice(0, places).map((c) => c.mint);
 
   // ---- sizes: per-place mixture over named coins + newcomer component ----
+  // The top 5 bunch near the leader (spread 0.16-0.35 log10 in the practice data)
+  // and newcomers enter near the top level, so the newcomer component is centred
+  // on the place-1 MC level with a small per-place fall-off, not on the old
+  // coins' low place means.
   const sizes: { place: number; bin: number; p: number }[] = [];
   for (let k = 0; k < places; k++) {
     const named = placeNamed.get(k)!;
@@ -243,12 +315,14 @@ function main(): void {
     for (const { mint, p } of named) {
       const c = coins.get(mint)!;
       const w = p * namedMass;
-      // curve coins: mixture of (no-grad) curve path and (grad) debut path
+      // mixture: survive path (curve: no-grad vs debut) + crash path
+      const surv = c.survival;
       const parts: { mean: number; sd: number; w: number }[] =
         c.lastVenue === "curve" && c.gradProb > 0
-          ? [{ mean: c.mean, sd: c.sd, w: w * (1 - c.gradProb) }, { mean: c.lastY + DEBUT_LOG_FACTOR, sd: DEBUT_SD, w: w * c.gradProb }]
-          : [{ mean: c.mean, sd: c.sd, w }];
+          ? [{ mean: c.mean, sd: c.sd * SIZE_SD_MULT, w: w * surv * (1 - c.gradProb) }, { mean: c.lastY + DEBUT_LOG_FACTOR, sd: DEBUT_SD, w: w * surv * c.gradProb }, { mean: c.lastY - CRASH_DROP, sd: CRASH_SD, w: w * (1 - surv) }]
+          : [{ mean: c.mean, sd: c.sd * SIZE_SD_MULT, w: w * surv }, { mean: c.lastY - CRASH_DROP, sd: CRASH_SD, w: w * (1 - surv) }];
       for (const part of parts) {
+        if (part.w <= 0) continue;
         for (let b = 0; b < nBins; b++) {
           const lo = b === 0 ? -Infinity : edges[b - 1];
           const hi = b === nBins - 1 ? Infinity : edges[b];
@@ -256,10 +330,11 @@ function main(): void {
         }
       }
     }
+    const newcomerCenter = placeMeanCap[0] - NEWCOMER_CENTER_OFF * k;
     for (let b = 0; b < nBins; b++) {
       const lo = b === 0 ? -Infinity : edges[b - 1];
       const hi = b === nBins - 1 ? Infinity : edges[b];
-      binP[b] += newcomerReserve * (normCdf((hi - placeMeanCap[k]) / NEWCOMER_SIZE_SD) - normCdf((lo - placeMeanCap[k]) / NEWCOMER_SIZE_SD));
+      binP[b] += newcomerReserve * (normCdf((hi - newcomerCenter) / NEWCOMER_SIZE_SD) - normCdf((lo - newcomerCenter) / NEWCOMER_SIZE_SD));
     }
     for (let b = 0; b < nBins; b++) {
       const p = floor6(binP[b]);
