@@ -41,7 +41,31 @@
 // size-relevant differences from v1 are SIZE_SD_MULT 1.15 (widens every
 // named coin's survive-path sd 15%) and the crash parts in the size
 // mixture. v5 sets SIZE_SD_MULT back to 1.0 to isolate the widening:
-// if v5's live size recovers to ~-16.92, the widening was the cost.
+// live v5 size -17.00 vs v1 -16.92, so the widening was only part of it.
+//
+// v6 (2026-11-12): size diagnosis (diag_size.py on the 3 proxy cuts):
+// newcomers take most top-5 places and land near the PLACE-1 level, not
+// at the model's low per-place means (true caps at places 2-5 sit 0.3-0.9
+// log10 above the forecast place means). One-at-a-time sweep on the 3
+// proxy cuts (proxy2 scorer, weighted): newcomer centre -> place-1 level
+// +2.60 size (improves on ALL 3 cuts); reserve base 0.45 -> 0.55 +1.01
+// but regresses the 2040 cut and is final-neutral (reserve caps at 0.65
+// at the 10h final horizon either way) — NOT included. Narrowing the
+// newcomer sd (0.45/0.50) HURTS (-1.34/-0.70) and widening (0.70/0.80)
+// is flat (+0.29/+0.38) — v3's live regression was the narrow sd +
+// high reserve combined with the centre, not the centre itself.
+// MC-histogram sizes (conditional on placing) tested and rejected:
+// -0.11, mixed per cut. v6 = centre at place-1 level ONLY
+// (placeMeanCap[0] - 0.06/place), sd 0.6, reserve base 0.45.
+// Proxy weighted: order -23.32 (unchanged), size -19.01, TOTAL -42.33
+// vs v5 -44.93 (+2.60). CAVEAT: v2 tested this exact centre live and
+// was a wash (size -17.26 vs v4 -17.21) — but that was the 0.5h practice
+// horizon, where the place means barely spread. At the 10h final
+// horizon the model's place means spread wide while the true top-5 caps
+// bunch near the leader (spread 0.16-0.35 in practice), so the correction
+// is larger and should help; downside is bounded (v2 was -0.05, not a
+// v3-style disaster). Live v5: rank ~#100, log -35.67 (order -18.67,
+// size -17.00).
 
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 
@@ -338,7 +362,7 @@ function main(): void {
         }
       }
     }
-    const newcomerCenter = placeMeanCap[k]; // v1 centre: MC mean cap at this place (v2/v3 recenter to place-1 level overshot live: v3 size -19.19 vs v1 -16.92)
+    const newcomerCenter = placeMeanCap[0] - NEWCOMER_CENTER_OFF * k; // v6: newcomers land near the place-1 level (diagnosed on proxy cuts); v3's live regression came from its narrow sd 0.35 + reserve 0.65, not the centre (isolated sweep: centre alone +2.60 size)
     for (let b = 0; b < nBins; b++) {
       const lo = b === 0 ? -Infinity : edges[b - 1];
       const hi = b === nBins - 1 ? Infinity : edges[b];
