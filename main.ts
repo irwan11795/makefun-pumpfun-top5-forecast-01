@@ -11,14 +11,38 @@
 //    from quote reserves vs the ~85 SOL completion level and the inflow rate;
 //    a debuting coin's cap centres on its curve cap (~0.7x, wide sd) because
 //    observed curve->pool transitions mostly land at or below the curve cap.
-//  - rank probabilities: seeded Monte Carlo (mulberry32, 400k samples) over
+//  - age-dependent crash hazard: a newborn curve coin can rug (hazard
+//    lambda0=0.15/h at birth, decaying with age tau=0.5h, floor 0.02/h);
+//    a crash costs ~1.0 log10 of cap.
+//  - rank probabilities: seeded Monte Carlo (mulberry32, 800k samples) over
 //    candidates; sample count chosen so the tail probabilities are stable.
 //  - unnamed reserve per place grows with horizon (newcomers are born after
-//    the cut; in practice ~3 of 9 coins that ever held top-5 were newcomers;
-//    tuned on two hold-outs against the house baseline, which this beats by
-//    ~+2.7 and ~+9.1 per read on the two cuts).
+//    the cut; in practice ~3 of 9 coins that ever held top-5 were newcomers)
+//    up to a 0.65 cap; the reserve also carries coins the model cannot name.
 //  - size bins: per-place mixture of the named coins' predicted cap
-//    distributions plus a newcomer component.
+//    distributions plus a newcomer component centred on the Monte Carlo
+//    mean cap at that place (placeMeanCap[k]), sd 0.6.
+//  - p=0 rows: likely-chart coins with negligible MC P(place) are named at
+//    p=0 (max 100 rows/place, format-compliant) so the unnamed share
+//    concentrates on the coins that could actually place.
+//
+// v4 (2026-11-12): v3 REGRESSED live (rank 213/343, log -38.3, size -19.19
+// vs v1 rank 67, log -35.92, size -16.92) even though the 3-cut proxy said
+// v3 beats v1 by +7.09. Lesson: the proxy cuts (truth 10-30 min after the
+// cut) do not represent the live reads (0-60 min after history_until);
+// the short-horizon tuning — narrow newcomer sd 0.35, centre at the
+// place-1 level, reserve 0.65 — overshot the live size distribution.
+// v4 reverts ONLY the size parameters to v1's (centre placeMeanCap[k],
+// sd 0.6, reserve base 0.45) and keeps the order-side improvements
+// (crash hazard, p=0 zero rows, 800k samples). Live v4: rank 93/372,
+// log -35.88 (order -18.67, size -17.21) — order +0.34 vs v1, size -0.29.
+//
+// v5 (2026-11-12): v4's size is -0.29 behind v1's. The remaining
+// size-relevant differences from v1 are SIZE_SD_MULT 1.15 (widens every
+// named coin's survive-path sd 15%) and the crash parts in the size
+// mixture. v5 sets SIZE_SD_MULT back to 1.0 to isolate the widening:
+// if v5's live size recovers to ~-16.92, the widening was the cost.
+
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 
 const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? "/input";
@@ -32,7 +56,7 @@ const CRASH_FLOOR = 0.02;     // residual crash hazard per hour
 const CRASH_DROP = 1.0;       // log10 cap lost in a crash
 const CRASH_SD = 0.5;         // sd of a crashed coin's log10 cap
 const NEWCOMER_CENTER_OFF = 0.06; // newcomer size centre falls off per place from place 1
-const SIZE_SD_MULT = 1.15;    // widen all size sds (calibration)
+const SIZE_SD_MULT = 1.0;     // no widening: v4's 1.15 cost live size (v4 -17.21 vs v1 -16.92)
 const REAL_P_MIN = 0.0005;    // smallest real-p row kept; below this the coin joins the unnamed pool
 const ZERO_MAX_P = 0.001;     // max MC P(place k) for a coin to be zeroed out at that place
 const ROW_CAP = 100;          // format cap: at most 100 rows per place
@@ -314,7 +338,7 @@ function main(): void {
         }
       }
     }
-    const newcomerCenter = placeMeanCap[0] - NEWCOMER_CENTER_OFF * k;
+    const newcomerCenter = placeMeanCap[k]; // v1 centre: MC mean cap at this place (v2/v3 recenter to place-1 level overshot live: v3 size -19.19 vs v1 -16.92)
     for (let b = 0; b < nBins; b++) {
       const lo = b === 0 ? -Infinity : edges[b - 1];
       const hi = b === nBins - 1 ? Infinity : edges[b];
